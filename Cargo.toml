@@ -1,0 +1,23 @@
+[package]
+name = "go-tool-synthesizer"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.89.0"
+description = "Turn a typed GoToolSpec into a complete, GSDS-conformant, borealis-profiled Go tool composing the pleme-io fleet primitives — the platform engine's first vertical."
+license = "MIT"
+repository = "https://github.com/pleme-io/go-tool-synthesizer"
+
+[dependencies]
+# The typed Go AST + renderer — we build GoFile values structurally and
+# render them through go_synthesizer::print_file. NEVER format!() raw Go.
+# Path dep to the sibling checkout (the canonicalized GoFile + FuncLit node
+# live on the feat/canonicalize-go-ast branch, not yet on the git default).
+go-synthesizer = { path = "../go-synthesizer" }
+serde = { version = "1", features = ["derive"] }
+# The derive that turns a Rust struct into a (defgotool …) Lisp compiler, plus
+# the reader/Sexp surface so consumers can compile a form into a GoToolSpec.
+tatara-lisp = { path = "../tatara/tatara-lisp" }
+# Non-basic field kinds (ToolKind enum, ConfigField/CommandSpec/FlagSpec nested
+# structs, Vec<Nested>) lower through the derive's serde fall-through, which
+# calls serde_json::from_value — so serde_json must be on the direct dep list.
+serde_json = "1"
