@@ -28,22 +28,31 @@
 use serde::{Deserialize, Serialize};
 use tatara_lisp::DeriveTataraDomain;
 
-/// The kind of tool to synthesize. `Cli` is the proven vertical; the others
-/// are reserved for milestone 2 (see crate-level GAPS).
+/// The kind of tool to synthesize. Each lowers to its BOREALIS §4 shape (see
+/// [`crate::lower`]).
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub enum ToolKind {
-    /// A leaf command-line tool: `run(ctx)` does the work directly.
+    /// A leaf command-line tool: the `run(ctx)` body runs the cli-go grammar
+    /// through `exit.Map(borealis.Execute(...))`; commands do the work directly.
     Cli,
-    /// A long-running service (a CLI whose `serve` subcommand nests
-    /// `lifecycle.New(...).Run(ctx)`). Reserved for M2.
+    /// A long-running service: a CLI whose `serve` subcommand's Run nests
+    /// `lifecycle.New(cfg.Lifecycle, …).Go("work", …).Run(ctx)`. When `server-go`
+    /// is declared the HTTP leaf is registered as a lifecycle actor; when
+    /// `controller-go` is declared the reconcile chassis runs as an App.Go unit.
     Service,
-    /// A one-shot / recurring daemon. Reserved for M2.
+    /// A long-running daemon: a `run` subcommand driving a `refresh-loop-go`
+    /// keep-fresh loop (recurring `loop.Run`, or a single `loop.Tick` when
+    /// [`GoToolSpec::oneshot`] is set). Falls back to a ctx-aware ticker when no
+    /// keep-fresh primitive is declared.
     Daemon,
-    /// A GitHub Action entrypoint. Reserved for M2.
+    /// A GitHub Action entrypoint: an `action` subcommand that `ParseInputs` the
+    /// `INPUT_*` env into the typed `Inputs`, plus a `gen` sub that renders the
+    /// typed `action.yml` composite metadata via `pleme-actions-shared-go`.
     Action,
-    /// A bare binary with no subcommand grammar. Reserved for M2.
+    /// A bare binary — the proven CLI shape (`Cli` with no `serve`/`run`).
     Binary,
-    /// A library (no `main`). Reserved for M2.
+    /// A library (no `main`): [`crate::lower`] emits no Go source and defers to
+    /// pleme-doc-gen's existing library scaffold.
     Library,
 }
 
@@ -179,6 +188,11 @@ pub struct GoToolSpec {
     /// engine layer; the generated tool imports tundra-openapi at runtime).
     #[serde(default)]
     pub api_ops: Vec<String>,
+    /// For [`ToolKind::Daemon`]: when true the daemon runs its loop ONCE and
+    /// exits (the one-shot reconcile), instead of the recurring keep-fresh loop.
+    /// Ignored for every other kind. Defaults to false (recurring).
+    #[serde(default)]
+    pub oneshot: bool,
     /// Override for the Nix flake builder function name. Reserved — the
     /// scaffolder (pleme-doc-gen) owns flake emission via flake_builder_for.
     pub flake_builder: Option<String>,
