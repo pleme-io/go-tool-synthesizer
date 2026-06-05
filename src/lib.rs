@@ -29,8 +29,10 @@
 mod lower;
 mod spec;
 
-pub use lower::lower;
-pub use spec::{CommandSpec, ConfigField, FieldType, FlagSpec, GoToolSpec, ToolKind};
+pub use lower::{forbidden_substrings, lower, lower_guarded, WorldsSeparateViolation};
+pub use spec::{
+    CommandSpec, ConfigField, FieldType, FlagSpec, GoToolSpec, ToolKind, DEFAULT_GO_VERSION,
+};
 
 #[cfg(test)]
 mod tests {
@@ -50,8 +52,8 @@ mod tests {
                   :profile "nord"
                   :primitives ("cli-go" "shikumi-go" "borealis" "errors-go" "logging-go")
                   :config-fields (
-                    (:name "greeting" :ty Str :yaml "greeting" :validate "required")
-                    (:name "locale"   :ty Str :yaml "locale"))
+                    (:name "greeting" :ty Str :yaml "greeting" :validate "required" :default "Hello")
+                    (:name "locale"   :ty Str :yaml "locale" :default "en"))
                   :commands (
                     (:name "greet"
                      :summary "print a themed greeting"
@@ -91,7 +93,8 @@ mod tests {
         // field with a named serde default; the accessor applies the real
         // default. (See crate GAPS — derive named-default limitation.)
         assert_eq!(s.resolved_profile(), "tundra"); // default
-        assert_eq!(s.resolved_go_version(), "1.22"); // default
+        assert_eq!(s.resolved_go_version(), "1.25.9"); // DEFAULT_GO_VERSION
+        assert_eq!(s.resolved_binary_name(), "minimal"); // binary_name defaults to name
         assert_eq!(s.theme_constructor(), "Tundra");
         assert_eq!(s.resolved_module_path(), "github.com/pleme-io/minimal");
         assert_eq!(s.env_prefix(), "MINIMAL_");
@@ -316,8 +319,14 @@ mod tests {
     fn action_parses_inputs_and_renders_yaml() {
         let r = rendered(&action_spec());
         let main = &r["main.go"];
-        assert!(main.contains("errs.Exit(run())"));
-        assert!(main.contains("root.Add(app.ActionCommand())"));
+        // The Action kind now reuses the proven Cli main shape (load → derive →
+        // theme → grammar → execute → exit) so cfg/log/theme reach the command
+        // tree. The ActionCommand is wired into app.New (alongside spec commands).
+        assert!(main.contains("errs.Exit(run(context.Background()))"));
+        assert!(main.contains("return exit.Map(borealis.Execute(ctx, root))"));
+        assert!(main.contains("root := app.New(cfg, log, theme)"));
+        let app = &r["internal/app/app.go"];
+        assert!(app.contains("ActionCommand()"));
         let action = &r["internal/app/action.go"];
         // The typed Inputs struct with input tags (required carried through).
         assert!(action.contains("Name string `input:\"name,required\"`"));
@@ -597,6 +606,133 @@ mod tests {
                 assert!(!src.contains("akeyless"), "generated source named akeyless");
             }
         }
+    }
+
+    // ── Milestone 4 hardening: defaults, Action :commands, render guard ───────
+
+    #[test]
+    fn default_config_uses_declared_defaults_not_field_name_placeholders() {
+        // FIX #2: DefaultConfig seeds each field from its `:default` (typed by
+        // FieldType), NEVER the field name. A field with no `:default` is omitted
+        // (Go zero value). The historical AuthKind:"AuthKind" placeholder is gone.
+        let s = spec_from(
+            r#"(defgotool :name "cfg-defaults" :kind Cli :description "d" :profile "nord"
+                :primitives ("cli-go" "shikumi-go" "borealis" "errors-go" "logging-go")
+                :config-fields (
+                  (:name "gateway_url" :ty Str :yaml "gatewayUrl")
+                  (:name "auth_kind"   :ty Str :yaml "authKind" :validate "required")
+                  (:name "retries"     :ty Int :yaml "retries" :default "3")
+                  (:name "verbose"     :ty Bool :yaml "verbose" :default "true")
+                  (:name "region"      :ty Str :yaml "region" :default "us-east-1")))"#,
+        );
+        let r = rendered(&s);
+        let cfg = &r["internal/app/config.go"];
+        // Declared defaults are seeded, typed by kind.
+        assert!(cfg.contains("Region:  \"us-east-1\",") || cfg.contains("Region: \"us-east-1\","));
+        assert!(cfg.contains("Retries: 3,"));
+        assert!(cfg.contains("Verbose: true,"));
+        // NO field-name-as-value placeholders for any field.
+        assert!(!cfg.contains("AuthKind: \"AuthKind\""), "field-name placeholder leaked:\n{cfg}");
+        assert!(!cfg.contains("GatewayUrl: \"GatewayUrl\""), "field-name placeholder leaked:\n{cfg}");
+        assert!(!cfg.contains("Region: \"Region\""));
+        // A field with no :default is simply not in the composite (Go zero value).
+        assert!(!cfg.contains("GatewayUrl:"));
+    }
+
+    #[test]
+    fn default_config_seeds_secret_via_new_secret() {
+        // A Secret field's :default is wrapped in shikumi.NewSecret so the typed
+        // shikumi.Secret[string] field is well-formed.
+        let s = spec_from(
+            r#"(defgotool :name "sec-default" :kind Cli :description "d" :profile "nord"
+                :primitives ("cli-go" "shikumi-go" "borealis" "errors-go" "logging-go")
+                :config-fields ((:name "token" :ty Secret :yaml "token" :default "seed")))"#,
+        );
+        let r = rendered(&s);
+        let cfg = &r["internal/app/config.go"];
+        assert!(cfg.contains("Token: shikumi.NewSecret(\"seed\"),"));
+    }
+
+    #[test]
+    fn action_renders_spec_commands_with_api_op_dispatch() {
+        // FIX #4: an Action tool's main wires BOTH the action/gen entrypoints AND
+        // the spec :commands (the same cli-go command tree + api_op dispatch the
+        // Cli kind builds). No hand-written fetch.go, no main.go edit needed.
+        let s = spec_from(
+            r#"(defgotool :name "borealis-ci" :kind Action :description "ci action" :profile "nord"
+                :primitives ("cli-go" "shikumi-go" "borealis" "errors-go" "logging-go" "pleme-actions-shared-go")
+                :config-fields ((:name "sink" :ty Str :yaml "sink" :default "json"))
+                :api-ops ("GetSecretValue")
+                :commands ((:name "fetch" :summary "resolve a secret" :api-op "GetSecretValue"
+                            :flags ((:name "name" :ty Str :usage "the path" :require-non-empty #t)
+                                    (:name "sink" :ty Str :default "json" :usage "output sink")))))"#,
+        );
+        let r = rendered(&s);
+        // main is the Cli shape with config/log/theme loaded.
+        let main = &r["main.go"];
+        assert!(main.contains("root := app.New(cfg, log, theme)"));
+        assert!(main.contains("return exit.Map(borealis.Execute(ctx, root))"));
+        // app.New wires BOTH ActionCommand AND the fetch command builder.
+        let app = &r["internal/app/app.go"];
+        assert!(app.contains("ActionCommand()"), "Action root missing action entrypoint:\n{app}");
+        assert!(app.contains("fetchCmd(cfg, log, theme)"), "Action root missing spec command:\n{app}");
+        // The fetch command dispatches the api_op through the abstract Client.
+        assert!(app.contains("client, err := NewClient(cfg)"));
+        assert!(app.contains("req := GetSecretValueRequest{"));
+        assert!(app.contains("Name: nameVal,"));
+        assert!(app.contains("Sink: sinkVal,"));
+        assert!(app.contains("resp, err := client.GetSecretValue(ctx, req)"));
+        // The action.go composition root still carries the action/gen entrypoints.
+        let action = &r["internal/app/action.go"];
+        assert!(action.contains("func ActionCommand() cli.Command"));
+        assert!(action.contains("ActionMeta().RenderActionYAML()"));
+        // The client seam carries the flag fields on the request.
+        let client = &r["internal/app/client.go"];
+        assert!(client.contains("type GetSecretValueRequest struct {"));
+        assert!(client.contains("Sink string"));
+        // Worlds-separate holds: nothing the engine emits names a vendor.
+        for (_, f) in lower(&s) {
+            assert!(!print_file(&f).to_lowercase().contains("akeyless"));
+        }
+    }
+
+    #[test]
+    fn render_guard_blocks_vendor_leak_under_tundra() {
+        // FIX #3: a vendor name in spec text (a command :long) under profile
+        // tundra fails the render-time worlds-separate guard with a clear error.
+        let s = spec_from(
+            r#"(defgotool :name "leaky" :kind Cli :description "d" :profile "tundra"
+                :primitives ("cli-go" "shikumi-go" "borealis" "errors-go" "logging-go")
+                :commands ((:name "go" :summary "do it"
+                            :long "Resolve a secret from the Akeyless gateway.")))"#,
+        );
+        // lower (unchecked) still emits — the leak is present.
+        assert!(lower(&s).iter().any(|(_, f)| print_file(f).to_lowercase().contains("akeyless")));
+        // lower_guarded FAILS, naming the file + token + the leak hint.
+        let err = lower_guarded(&s).expect_err("guard must reject the vendor leak");
+        assert!(err.file.contains("app.go"), "violation file was: {}", err.file);
+        assert_eq!(err.token, "akeyless");
+        let msg = err.to_string();
+        assert!(msg.contains("worlds-separate violation"));
+        assert!(msg.contains("akeyless"));
+        assert!(msg.contains(":long") || msg.contains("spec text"));
+    }
+
+    #[test]
+    fn render_guard_passes_clean_tundra_and_ignores_nord() {
+        // A clean tundra tool passes the guard; nord/default forbid nothing, so an
+        // "akeyless" string under nord would pass (the public world is vendor-free
+        // by convention, not by the forbidden-substrings list).
+        let clean_tundra = spec_from(
+            r#"(defgotool :name "tundra-clean" :kind Cli :description "d" :profile "tundra"
+                :primitives ("cli-go" "shikumi-go" "borealis" "errors-go" "logging-go")
+                :commands ((:name "go" :summary "do it" :long "Resolve a secret generically.")))"#,
+        );
+        assert!(lower_guarded(&clean_tundra).is_ok());
+        // The profile forbidden-substrings table: tundra forbids akeyless, nord none.
+        assert_eq!(forbidden_substrings("tundra"), &["akeyless"]);
+        assert!(forbidden_substrings("nord").is_empty());
+        assert!(forbidden_substrings("").is_empty());
     }
 
     #[test]

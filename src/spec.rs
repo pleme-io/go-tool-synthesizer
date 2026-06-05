@@ -99,6 +99,12 @@ pub struct ConfigField {
     pub yaml: Option<String>,
     /// An optional go-playground/validator tag body (e.g. "required").
     pub validate: Option<String>,
+    /// An optional declared default value (as a string literal; coerced to the
+    /// Go type at lower). Seeds `DefaultConfig()` — the lowest-precedence
+    /// shikumi baseline. When absent the field gets the zero value of its type
+    /// (`""` for Str/Secret, `0` for Int, `false` for Bool). NEVER the field
+    /// name (the historical placeholder bug).
+    pub default: Option<String>,
     /// An optional env-var suffix appended to the tool's EnvPrefix. Currently
     /// informational (shikumi binds env from the field name); reserved.
     pub env_suffix: Option<String>,
@@ -170,7 +176,10 @@ pub struct GoToolSpec {
     pub profile: String,
     /// Explicit Go module path. Defaults to `github.com/pleme-io/<name>`.
     pub module_path: Option<String>,
-    /// Go toolchain version directive. Defaults to "1.22".
+    /// Go toolchain version directive. Defaults to the fleet/host standard
+    /// [`DEFAULT_GO_VERSION`] ("1.25.9"). pleme-doc-gen pins both the `go` and
+    /// `toolchain` go.mod directives to this single value so `go mod tidy` can
+    /// never silently bump the tool to a dependency's higher directive.
     #[serde(default = "default_go_version")]
     pub go_version: String,
     /// The fleet primitives this tool composes (e.g. "cli-go", "shikumi-go",
@@ -193,17 +202,30 @@ pub struct GoToolSpec {
     /// Ignored for every other kind. Defaults to false (recurring).
     #[serde(default)]
     pub oneshot: bool,
+    /// Optional released-binary name override. When set, the caixa/flake
+    /// emission names the built binary this (e.g. "akl-auth") instead of the
+    /// module leaf (`name`). Lets the published binary differ from the Go
+    /// module leaf. Resolved via [`GoToolSpec::resolved_binary_name`].
+    pub binary_name: Option<String>,
     /// Override for the Nix flake builder function name. Reserved — the
     /// scaffolder (pleme-doc-gen) owns flake emission via flake_builder_for.
     pub flake_builder: Option<String>,
 }
+
+/// The fleet/host-standard Go toolchain version. pleme-doc-gen pins both the
+/// go.mod / go.work `go` directive AND a `toolchain go<VER>` line to this single
+/// constant, so `go mod tidy` / `go work sync` cannot silently bump the tool to
+/// a dependency's higher directive (e.g. akeyless-go declares `go 1.26`, which
+/// bumped a tool to 1.26.0 and then `GOTOOLCHAIN=local` refused to build). One
+/// place to change the whole fleet's pin.
+pub const DEFAULT_GO_VERSION: &str = "1.25.9";
 
 fn default_profile() -> String {
     "tundra".to_string()
 }
 
 fn default_go_version() -> String {
-    "1.22".to_string()
+    DEFAULT_GO_VERSION.to_string()
 }
 
 impl GoToolSpec {
@@ -223,8 +245,8 @@ impl GoToolSpec {
         }
     }
 
-    /// The resolved Go toolchain version, applying the "1.22" default when
-    /// empty (same derive-default caveat as `resolved_profile`).
+    /// The resolved Go toolchain version, applying the [`DEFAULT_GO_VERSION`]
+    /// default when empty (same derive-default caveat as `resolved_profile`).
     #[must_use]
     pub fn resolved_go_version(&self) -> String {
         if self.go_version.is_empty() {
@@ -232,6 +254,17 @@ impl GoToolSpec {
         } else {
             self.go_version.clone()
         }
+    }
+
+    /// The resolved released-binary name: the explicit `binary_name` slot, else
+    /// the module/tool leaf `name`. Lets a tool's published binary differ from
+    /// its Go module leaf (e.g. module `tundra-auth` → binary `akl-auth`).
+    #[must_use]
+    pub fn resolved_binary_name(&self) -> String {
+        self.binary_name
+            .clone()
+            .filter(|b| !b.is_empty())
+            .unwrap_or_else(|| self.name.clone())
     }
 
     /// The resolved Go module path: the explicit `module_path` or the fleet
