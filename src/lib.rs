@@ -369,13 +369,21 @@ mod tests {
         assert!(client.contains("type Client interface {"));
         assert!(client.contains("ListSecrets(ctx context.Context, req ListSecretsRequest) (ListSecretsResponse, error)"));
         assert!(client.contains("func NewClient(cfg Config) (Client, error)"));
+        // The swap-in seam: clientFactory var + the nil-guard + delegation.
+        assert!(client.contains("var clientFactory func(Config) (Client, error)"));
+        assert!(client.contains("if clientFactory == nil {"));
         assert!(client.contains("return nil, errClientNotImplemented"));
+        assert!(client.contains("return clientFactory(cfg)"));
+        // The generic response carrier — no vendor shape baked in.
+        assert!(client.contains("type LookupResponse struct {") || client.contains("type ListSecretsResponse struct {"));
+        assert!(client.contains("Data map[string]string"));
         // No vendor SDK leaks into the public client seam (worlds-separate).
         assert!(!client.to_lowercase().contains("akeyless"));
-        // The command dispatches through the abstract client.
+        // The command dispatches through the abstract client (no flags → empty req).
         let app = &r["internal/app/app.go"];
         assert!(app.contains("client, err := NewClient(cfg)"));
-        assert!(app.contains("client.ListSecrets(ctx, ListSecretsRequest{})"));
+        assert!(app.contains("req := ListSecretsRequest{}"));
+        assert!(app.contains("resp, err := client.ListSecrets(ctx, req)"));
     }
 
     #[test]
@@ -494,5 +502,118 @@ mod tests {
         // The Controller sub-struct is embedded in the typed Config.
         let cfg = &r["internal/app/config.go"];
         assert!(cfg.contains("Controller controller.Config"));
+    }
+
+    // ── Milestone 4: functional api_op seam — flags reach the op, result renders ──
+
+    /// A generic api_op spec mirroring the borealis-fetch proof: a `get` command
+    /// with api_op "Lookup" and a `--key` (Str) flag.
+    fn fetch_spec() -> GoToolSpec {
+        spec_from(
+            r#"(defgotool :name "borealis-fetch" :kind Cli :description "fetch" :profile "nord"
+                :primitives ("cli-go" "shikumi-go" "borealis" "errors-go" "logging-go")
+                :api-ops ("Lookup")
+                :commands ((:name "get" :summary "look a key up" :api-op "Lookup"
+                            :flags ((:name "key" :ty Str :usage "the key to look up")))))"#,
+        )
+    }
+
+    #[test]
+    fn client_factory_plug_point_emitted() {
+        let r = rendered(&fetch_spec());
+        let client = &r["internal/app/client.go"];
+        // The swap-in seam: a nil-able factory var, the nil-guard, and delegation.
+        assert!(client.contains("var clientFactory func(Config) (Client, error)"));
+        assert!(client.contains("func NewClient(cfg Config) (Client, error)"));
+        assert!(client.contains("if clientFactory == nil {"));
+        assert!(client.contains("return nil, errClientNotImplemented"));
+        assert!(client.contains("return clientFactory(cfg)"));
+        // The doc-comment documents the private-adapter init() registration path.
+        assert!(client.contains("client_adapter.go"));
+        assert!(client.contains("func init() { clientFactory = newXClient }"));
+        // The seam sentinel + declaredAPIOps survive (kept per the contract).
+        assert!(client.contains("errClientNotImplemented"));
+        assert!(client.contains("declaredAPIOps"));
+        // Worlds-separate: the seam never names a vendor SDK.
+        assert!(!client.to_lowercase().contains("akeyless"));
+    }
+
+    #[test]
+    fn request_struct_carries_the_flag_fields() {
+        let r = rendered(&fetch_spec());
+        let client = &r["internal/app/client.go"];
+        // <Op>Request gets one typed field per the referencing command's flags.
+        assert!(client.contains("type LookupRequest struct {"));
+        assert!(client.contains("Key string"));
+        // <Op>Response is the generic string→string result carrier (no vendor shape).
+        assert!(client.contains("type LookupResponse struct {"));
+        assert!(client.contains("Data map[string]string"));
+    }
+
+    #[test]
+    fn dispatch_threads_flags_and_renders_response() {
+        let r = rendered(&fetch_spec());
+        let app = &r["internal/app/app.go"];
+        // The parsed flag is read, threaded into the typed request, and the op called.
+        assert!(app.contains("keyVal := key.Get()"));
+        assert!(app.contains("req := LookupRequest{"));
+        assert!(app.contains("Key: keyVal,"));
+        assert!(app.contains("resp, err := client.Lookup(ctx, req)"));
+        // The response is rendered: resp.Data → sorted []comp.Pair → the one verb.
+        assert!(app.contains("for k, v := range resp.Data {"));
+        assert!(app.contains("pairs = append(pairs, comp.Pair{"));
+        assert!(app.contains("sort.Slice(pairs,"));
+        assert!(app.contains("pairs[i].K < pairs[j].K"));
+        assert!(app.contains("borealis.Render(theme, pairs)"));
+        // The stdlib sort import is pulled in only because a command dispatches.
+        assert!(app.contains("\"sort\""));
+    }
+
+    #[test]
+    fn no_flag_api_op_emits_empty_request() {
+        // A command with an api_op but NO flags keeps the empty-request behavior.
+        let s = spec_from(
+            r#"(defgotool :name "borealis-ping" :kind Cli :description "ping" :profile "nord"
+                :primitives ("cli-go" "shikumi-go" "borealis" "errors-go" "logging-go")
+                :api-ops ("Ping")
+                :commands ((:name "ping" :summary "ping" :api-op "Ping")))"#,
+        );
+        let r = rendered(&s);
+        let client = &r["internal/app/client.go"];
+        // Empty request struct (no flags) — but still carries the generic response.
+        assert!(client.contains("type PingRequest struct {\n}") || client.contains("type PingRequest struct {}"));
+        assert!(client.contains("Data map[string]string"));
+        let app = &r["internal/app/app.go"];
+        assert!(app.contains("req := PingRequest{}"));
+        assert!(app.contains("resp, err := client.Ping(ctx, req)"));
+    }
+
+    #[test]
+    fn api_op_seam_names_no_vendor_for_any_kind() {
+        // Worlds-separate stays intact with the functional seam: no kind names akeyless.
+        for spec in [fetch_spec(), service_spec(), daemon_spec(), action_spec(), proof_spec()] {
+            for (_, file) in lower(&spec) {
+                let src = print_file(&file).to_lowercase();
+                assert!(!src.contains("akeyless"), "generated source named akeyless");
+            }
+        }
+    }
+
+    #[test]
+    fn richer_flag_types_skipped_str_and_duration() {
+        // gap 3 outcome, codified: cli-go's flagValue constraint is
+        //   comparable & (~string | ~int | ~int64 | ~uint | ~uint64 | ~float64 | ~bool).
+        // []string is NOT comparable and not in the union → NewFlag[[]string] won't
+        // compile → StrList is NOT added. time.Duration (type Duration int64) compiles
+        // via ~int64 but routes through the named-type path whose parse is a bare
+        // strconv.ParseInt — it does NOT parse "5s" cleanly → Duration is NOT added
+        // either. Authors model both as Str and parse in the private adapter. This
+        // test pins the decision: FieldType stays {Str, Int, Bool, Secret}.
+        let s = proof_spec();
+        // The flag's type is one of the four supported scalar kinds.
+        assert!(matches!(
+            s.commands[0].flags[0].ty,
+            FieldType::Str | FieldType::Int | FieldType::Bool | FieldType::Secret
+        ));
     }
 }

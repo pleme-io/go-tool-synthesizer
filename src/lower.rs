@@ -64,6 +64,26 @@ fn uses_client_seam(spec: &GoToolSpec) -> bool {
     !declared_api_ops(spec).is_empty()
 }
 
+/// The flags of the (first) command that references `op` as its `api_op` —
+/// these typed flags become the fields of `<Op>Request` so a parsed flag value
+/// can be threaded into the op call. Walks the recursive command tree. Returns
+/// an empty slice when no command references `op` (a spec-level-only api_op, or
+/// a command with an api_op but no flags), keeping the empty-request behavior.
+fn flags_for_op<'a>(spec: &'a GoToolSpec, op: &str) -> &'a [FlagSpec] {
+    fn walk<'a>(cmds: &'a [CommandSpec], op: &str) -> Option<&'a [FlagSpec]> {
+        for c in cmds {
+            if c.api_op.as_deref() == Some(op) {
+                return Some(&c.flags);
+            }
+            if let Some(found) = walk(&c.sub, op) {
+                return Some(found);
+            }
+        }
+        None
+    }
+    walk(&spec.commands, op).unwrap_or(&[])
+}
+
 /// One kind-specific primitive sub-struct embedded into the tool's `Config`
 /// (e.g. `Lifecycle lifecycle.Config`). Drives both the `Config` field and the
 /// matching import.
@@ -868,6 +888,12 @@ fn build_app(spec: &GoToolSpec) -> GoFile {
         GoImport::plain("github.com/pleme-io/borealis/comp"),
         GoImport::aliased("cli", "github.com/pleme-io/cli-go"),
     ];
+    // A command that dispatches an api_op renders resp.Data as a sorted KV block,
+    // which needs the stdlib "sort" package. Add it only when a command has an
+    // api_op (keeping the import set minimal for flag-only / api-op-free tools).
+    if spec.commands.iter().any(|c| c.api_op.is_some()) {
+        f.imports.push(GoImport::plain("sort"));
+    }
 
     // var Version = "0.1.0"
     f.decls.push(GoDecl::Var(GoVarDecl {
@@ -1353,15 +1379,16 @@ fn build_command_run_body(_spec: &GoToolSpec, cmd: &CommandSpec) -> GoBlock {
     )));
     b.push(GoStmt::Blank);
 
-    // api_op dispatch: build the abstract Client and call the typed operation.
-    // The concrete client is supplied by a PRIVATE adapter (M3 absorption); the
-    // generated tool only knows the interface (worlds-separate).
+    // api_op dispatch: build the abstract Client, thread the parsed flags into the
+    // typed request, call the op, and render the response. The concrete client is
+    // supplied by a PRIVATE adapter (M3 absorption); the tool only knows the
+    // interface (worlds-separate).
     if let Some(op) = &cmd.api_op {
         let op_pascal = pascal_case(op);
         b.push(GoStmt::Comment(
             "Dispatch through the abstract app.Client (one method per api_op). The concrete\n\
              client is a PRIVATE adapter supplied later (M3) — the public tool never names a\n\
-             vendor SDK; here NewClient returns the not-yet-implemented seam sentinel."
+             vendor SDK; NewClient delegates to the clientFactory the adapter registers."
                 .into(),
         ));
         // client, err := NewClient(cfg)
@@ -1373,33 +1400,120 @@ fn build_command_run_body(_spec: &GoToolSpec, cmd: &CommandSpec) -> GoBlock {
             GoExpr::ident("ErrConfig"),
             vec![GoExpr::ident("err")],
         )));
-        // if _, err := client.<Op>(ctx, <Op>Request{}); err != nil { return err }
-        let mut call_if = GoBlock::new();
-        call_if.push(GoStmt::Return(vec![GoExpr::ident("err")]));
-        b.push(GoStmt::If {
-            init: Some(Box::new(GoStmt::ShortDecl {
-                names: vec!["_".into(), "err".into()],
-                values: vec![GoExpr::call(
-                    GoExpr::sel(GoExpr::ident("client"), &op_pascal),
-                    vec![
-                        GoExpr::ident("ctx"),
-                        GoExpr::Composite {
-                            ty: GoType::named(format!("{op_pascal}Request")),
-                            fields: vec![],
-                            addr_of: false,
-                        },
-                    ],
-                )],
-            })),
-            cond: GoExpr::binary("!=", GoExpr::ident("err"), GoExpr::nil()),
-            body: call_if,
-            else_body: None,
+
+        // req := <Op>Request{ <Field>: <flag>Val, … } — thread the parsed flags in.
+        let req_fields: Vec<(Option<String>, GoExpr)> = cmd
+            .flags
+            .iter()
+            .map(|fl| {
+                (
+                    Some(pascal_case(&fl.name)),
+                    GoExpr::ident(format!("{}Val", flag_var(&fl.name))),
+                )
+            })
+            .collect();
+        b.push(GoStmt::ShortDecl {
+            names: vec!["req".into()],
+            values: vec![GoExpr::Composite {
+                ty: GoType::named(format!("{op_pascal}Request")),
+                fields: req_fields,
+                addr_of: false,
+            }],
         });
+
+        // resp, err := client.<Op>(ctx, req)
+        b.push(GoStmt::ShortDecl {
+            names: vec!["resp".into(), "err".into()],
+            values: vec![GoExpr::call(
+                GoExpr::sel(GoExpr::ident("client"), &op_pascal),
+                vec![GoExpr::ident("ctx"), GoExpr::ident("req")],
+            )],
+        });
+        b.push(err_check_return(GoExpr::ident("err")));
         b.push(GoStmt::Blank);
+
+        // Render the op result: a KV block of resp.Data through the one verb. The
+        // map is projected onto a sorted []comp.Pair so the output is stable.
+        b.push(GoStmt::Comment(
+            "Render the op result as a KV block through the one borealis.Render verb (Law 4),\n\
+             not fmt-printed. Keys are sorted for stable output across map iterations."
+                .into(),
+        ));
+        // pairs := make([]comp.Pair, 0, len(resp.Data))
+        b.push(GoStmt::ShortDecl {
+            names: vec!["pairs".into()],
+            values: vec![GoExpr::call(
+                GoExpr::ident("make"),
+                vec![
+                    GoExpr::TypeExpr(GoType::slice(GoType::qualified("comp", "Pair"))),
+                    GoExpr::Lit(go_synthesizer::GoLit::Int(0)),
+                    GoExpr::call(
+                        GoExpr::ident("len"),
+                        vec![GoExpr::sel(GoExpr::ident("resp"), "Data")],
+                    ),
+                ],
+            )],
+        });
+        // for k, v := range resp.Data { pairs = append(pairs, comp.Pair{K: k, V: v}) }
+        let mut range_body = GoBlock::new();
+        range_body.push(GoStmt::Assign {
+            lhs: vec![GoExpr::ident("pairs")],
+            rhs: vec![GoExpr::call(
+                GoExpr::ident("append"),
+                vec![
+                    GoExpr::ident("pairs"),
+                    GoExpr::Composite {
+                        ty: GoType::qualified("comp", "Pair"),
+                        fields: vec![
+                            (Some("K".into()), GoExpr::ident("k")),
+                            (Some("V".into()), GoExpr::ident("v")),
+                        ],
+                        addr_of: false,
+                    },
+                ],
+            )],
+        });
+        b.push(GoStmt::ForRange {
+            key: Some("k".into()),
+            value: Some("v".into()),
+            range: GoExpr::sel(GoExpr::ident("resp"), "Data"),
+            body: range_body,
+        });
+        // sort.Slice(pairs, func(i, j int) bool { return pairs[i].K < pairs[j].K })
+        let mut less_body = GoBlock::new();
+        less_body.push(GoStmt::Return(vec![GoExpr::binary(
+            "<",
+            GoExpr::sel(GoExpr::index(GoExpr::ident("pairs"), GoExpr::ident("i")), "K"),
+            GoExpr::sel(GoExpr::index(GoExpr::ident("pairs"), GoExpr::ident("j")), "K"),
+        )]));
+        b.push(GoStmt::Expr(GoExpr::call(
+            GoExpr::path(&["sort", "Slice"]),
+            vec![
+                GoExpr::ident("pairs"),
+                closure(
+                    vec![
+                        GoParam { name: "i".into(), ty: GoType::named("int") },
+                        GoParam { name: "j".into(), ty: GoType::named("int") },
+                    ],
+                    vec![GoType::named("bool")],
+                    less_body,
+                ),
+            ],
+        )));
+        // fmt.Println(borealis.Render(theme, pairs))
+        b.push(GoStmt::Expr(GoExpr::call(
+            GoExpr::path(&["fmt", "Println"]),
+            vec![GoExpr::call(
+                GoExpr::path(&["borealis", "Render"]),
+                vec![GoExpr::ident("theme"), GoExpr::ident("pairs")],
+            )],
+        )));
+        b.push(GoStmt::Return(vec![GoExpr::nil()]));
+        return b;
     }
 
-    // Build the rendered message. If there is a "name" flag and a "greeting"
-    // config field, compose them; otherwise render a generic success label.
+    // No api_op: render a generic success label. If there is a "name" flag and a
+    // "greeting" config field, compose them; otherwise render a generic label.
     let label_expr = build_command_label(cmd);
 
     // fmt.Println(borealis.Render(theme, []comp.Item{ {Role: borealis.Success, Label: <label>} }))
@@ -2751,7 +2865,17 @@ fn build_client(spec: &GoToolSpec) -> GoFile {
          author it by hand in a SEPARATE file (e.g. client_adapter.go), free of any generated\n\
          header, where it may import a vendor SDK. The public engine never bakes in a vendor\n\
          SDK (worlds-separate); regenerating this file overwrites the interface but never\n\
-         touches your hand-written adapter."
+         touches your hand-written adapter.\n\
+         \n\
+         The swap-in seam is the package-level clientFactory func: NewClient calls it when set,\n\
+         else returns errClientNotImplemented. A private adapter registers the concrete\n\
+         constructor in its own init() — e.g. in internal/app/client_adapter.go:\n\
+         \n\
+         \tfunc init() { clientFactory = newXClient }\n\
+         \n\
+         where newXClient is the hand-written constructor returning the concrete Client. The\n\
+         adapter file is never regenerated, so re-forging this file leaves the registration\n\
+         intact (the init runs at import time regardless of which file declares clientFactory)."
             .into(),
     );
     f.imports = vec![GoImport::plain("context")];
@@ -2762,23 +2886,47 @@ fn build_client(spec: &GoToolSpec) -> GoFile {
         let op_pascal = pascal_case(op);
         let req = format!("{op_pascal}Request");
         let resp = format!("{op_pascal}Response");
-        // type <Op>Request struct{} and <Op>Response struct{} placeholders.
+        // type <Op>Request struct { <Field> <goType>; … } — one typed field per
+        // the referencing command's flags, so a parsed flag value reaches the op.
+        let req_fields: Vec<GoField> = flags_for_op(spec, op)
+            .iter()
+            .map(|fl| GoField {
+                name: Some(pascal_case(&fl.name)),
+                ty: config_field_type(&fl.ty),
+                doc: Some(format!("{} carries the --{} flag value.", pascal_case(&fl.name), fl.name)),
+                markers: vec![],
+                tags: vec![],
+            })
+            .collect();
         f.decls.push(GoDecl::Type(GoTypeDecl {
             name: req.clone(),
             doc: Some(format!(
-                "{req} is the typed request placeholder for the {op} operation. A private\n\
-                 adapter maps it onto the concrete SDK request (M3).",
+                "{req} is the typed request for the {op} operation: one field per the command's\n\
+                 flags. A private adapter maps it onto the concrete SDK request (M3).",
             )),
             markers: vec![],
-            body: GoTypeBody::Struct(vec![]),
+            body: GoTypeBody::Struct(req_fields),
         }));
+        // type <Op>Response struct { Data map[string]string } — a generic result
+        // carrier the adapter fills; the public engine bakes in no vendor shape.
         f.decls.push(GoDecl::Type(GoTypeDecl {
             name: resp.clone(),
             doc: Some(format!(
-                "{resp} is the typed response placeholder for the {op} operation.",
+                "{resp} is the generic typed response for the {op} operation: a string→string\n\
+                 result map the private adapter fills. No vendor shape is baked into the public\n\
+                 engine (worlds-separate); the tool renders Data through the one borealis verb.",
             )),
             markers: vec![],
-            body: GoTypeBody::Struct(vec![]),
+            body: GoTypeBody::Struct(vec![GoField {
+                name: Some("Data".into()),
+                ty: GoType::Map(
+                    Box::new(GoType::named("string")),
+                    Box::new(GoType::named("string")),
+                ),
+                doc: Some("Data is the generic result carrier the adapter populates.".into()),
+                markers: vec![],
+                tags: vec![],
+            }]),
         }));
         // The interface method: <Op>(ctx context.Context, req <Op>Request) (<Op>Response, error)
         iface_methods.push(go_synthesizer::GoIfaceMethod {
@@ -2839,7 +2987,32 @@ fn build_client(spec: &GoToolSpec) -> GoFile {
         block_id: None,
     }));
 
-    // func NewClient(cfg Config) (Client, error) { return nil, errClientNotImplemented }
+    // var clientFactory func(cfg Config) (Client, error) — the swap-in plug-point.
+    f.decls.push(GoDecl::Var(GoVarDecl {
+        name: "clientFactory".into(),
+        ty: Some(GoType::FuncSignature {
+            params: vec![GoType::named("Config")],
+            returns: vec![GoType::named("Client"), GoType::named("error")],
+        }),
+        value: None,
+        doc: Some(
+            "clientFactory is the swap-in plug-point for the concrete Client constructor. It is\n\
+             nil in the generated tool (no vendor SDK leaks into the public engine — worlds-\n\
+             separate); a PRIVATE adapter (hand-written internal/app/client_adapter.go, never\n\
+             regenerated) registers the concrete constructor in its init():\n\
+             \n\
+             \tfunc init() { clientFactory = newXClient }\n\
+             \n\
+             Because init() runs at import time, the registration survives re-forging this file."
+                .into(),
+        ),
+        block_id: None,
+    }));
+
+    // func NewClient(cfg Config) (Client, error) {
+    //   if clientFactory == nil { return nil, errClientNotImplemented }
+    //   return clientFactory(cfg)
+    // }
     let mut nc_body = GoBlock::new();
     if references_tundra && !ops.is_empty() {
         nc_body.push(GoStmt::Comment(
@@ -2849,14 +3022,31 @@ fn build_client(spec: &GoToolSpec) -> GoFile {
                 .into(),
         ));
     }
-    nc_body.push(GoStmt::Return(vec![GoExpr::nil(), GoExpr::ident("errClientNotImplemented")]));
+    // if clientFactory == nil { return nil, errClientNotImplemented }
+    let mut nil_guard = GoBlock::new();
+    nil_guard.push(GoStmt::Return(vec![
+        GoExpr::nil(),
+        GoExpr::ident("errClientNotImplemented"),
+    ]));
+    nc_body.push(GoStmt::If {
+        init: None,
+        cond: GoExpr::binary("==", GoExpr::ident("clientFactory"), GoExpr::nil()),
+        body: nil_guard,
+        else_body: None,
+    });
+    // return clientFactory(cfg)
+    nc_body.push(GoStmt::Return(vec![GoExpr::call(
+        GoExpr::ident("clientFactory"),
+        vec![GoExpr::ident("cfg")],
+    )]));
     f.decls.push(GoDecl::Func(GoFuncDecl {
         name: "NewClient".into(),
         doc: Some(
             "NewClient is the constructor seam: it returns the abstract Client a private adapter\n\
-             implements (the M3 absorption layer). Until then it returns errClientNotImplemented\n\
-             so the generated tool compiles and dispatches through the interface, with the\n\
-             concrete client deferred — the public engine never names or imports a vendor SDK."
+             implements (the M3 absorption layer) by delegating to clientFactory. When no adapter\n\
+             has registered a factory it returns errClientNotImplemented, so the generated tool\n\
+             compiles and dispatches through the interface with the concrete client deferred — the\n\
+             public engine never names or imports a vendor SDK."
                 .into(),
         ),
         recv: None,
