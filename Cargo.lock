@@ -185,7 +185,7 @@ source = "git+https://github.com/pleme-io/synthesizer-core#bd1767f5d334a2d5a2deb
 
 [[package]]
 name = "tatara-lisp"
-version = "0.2.3"
+version = "0.2.10"
 dependencies = [
  "blake3",
  "serde",
@@ -196,7 +196,7 @@ dependencies = [
 
 [[package]]
 name = "tatara-lisp-derive"
-version = "0.2.3"
+version = "0.2.10"
 dependencies = [
  "proc-macro2",
  "quote",
