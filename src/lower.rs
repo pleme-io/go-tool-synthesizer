@@ -389,12 +389,16 @@ fn generated_by_header(spec: &GoToolSpec) -> String {
 /// command in their own composition-root file and only need the `Version` const,
 /// so they get a lean `app.go` + a matching smoke test.
 fn base_app_files(spec: &GoToolSpec) -> Vec<(PathBuf, GoFile)> {
-    // Cli/Binary AND Action carry the full cli-go grammar in app.go: the Action
-    // kind's main wires BOTH its action/gen composition root (action.go) AND the
-    // spec :commands (the same command tree + api_op dispatch the Cli kind
-    // builds). Service/Daemon keep the lean app.go (their command lives in its
-    // own composition-root file).
-    let full_grammar = matches!(spec.kind, ToolKind::Cli | ToolKind::Binary | ToolKind::Action);
+    // Cli/Binary, Action AND Service carry the full cli-go grammar in app.go: the
+    // Action kind's main wires BOTH its action/gen composition root (action.go)
+    // AND the spec :commands; the Service kind wires its serve composition root
+    // (serve.go's ServeCommand) ALONGSIDE the spec :commands — both live under the
+    // one `app.New` App, so a forged Service tool exposes its serve verb (carrying
+    // the spec serve command's flags + summary/long) AND every extra spec
+    // :command with ZERO hand-edits to main/app. Only Daemon keeps the lean app.go
+    // (its run command lives in its own composition-root file).
+    let full_grammar =
+        matches!(spec.kind, ToolKind::Cli | ToolKind::Binary | ToolKind::Action | ToolKind::Service);
     let mut files = vec![
         (PathBuf::from("internal/app/config.go"), build_config(spec)),
         (PathBuf::from("internal/app/errors.go"), build_errors(spec)),
@@ -1012,6 +1016,12 @@ fn build_app(spec: &GoToolSpec) -> GoFile {
     f.decls.push(GoDecl::Func(build_config_show_cmd(spec)));
     f.decls.push(GoDecl::Func(build_config_pairs(spec)));
     for cmd in &spec.commands {
+        // For a Service, the spec "serve" command is rendered by serve.go's
+        // ServeCommand (it owns the lifecycle/controller nesting + carries the spec
+        // flags/summary/long), so it gets no separate generic serveCmd builder.
+        if spec.kind == ToolKind::Service && cmd.name == "serve" {
+            continue;
+        }
         f.decls.push(GoDecl::Func(build_command_fn(spec, cmd)));
     }
 
@@ -1054,7 +1064,20 @@ fn build_new(spec: &GoToolSpec) -> GoFuncDecl {
     if spec.kind == ToolKind::Action {
         add_args.push(GoExpr::call(GoExpr::ident("ActionCommand"), vec![]));
     }
+    // The Service kind wires its serve composition root (serve.go's ServeCommand,
+    // carrying the spec serve command's flags + summary/long) ALONGSIDE the spec
+    // :commands — both live under the one App. ServeCommand IS the spec's "serve"
+    // command (it owns the lifecycle/controller nesting), so the regular command
+    // loop skips a "serve"-named command to avoid a duplicate builder.
+    if spec.kind == ToolKind::Service {
+        add_args.push(GoExpr::call(GoExpr::ident("ServeCommand"), vec![]));
+    }
     for cmd in &spec.commands {
+        // For a Service, the "serve" command is rendered as ServeCommand (above) —
+        // its flags/summary/long flow onto that builder, not a separate serveCmd.
+        if spec.kind == ToolKind::Service && cmd.name == "serve" {
+            continue;
+        }
         add_args.push(GoExpr::call(
             GoExpr::ident(command_fn_name(&cmd.name)),
             command_fn_call_args(),
@@ -1857,9 +1880,22 @@ fn build_kind_main(spec: &GoToolSpec, cmd_builder: &str, kind_label: &str) -> Go
 /// run).Run(ctx)`. The server-go / controller-go leaf is wired only when that
 /// primitive is declared.
 fn lower_service(spec: &GoToolSpec) -> Vec<(PathBuf, GoFile)> {
-    let mut files = vec![(PathBuf::from("main.go"), build_kind_main(spec, "ServeCommand", "service"))];
+    // The Service kind reuses the proven Cli main (load → derive → theme → grammar
+    // → execute → exit) so cfg/log/theme reach BOTH the spec :commands (their
+    // api_op dispatch needs cfg for NewClient) and the serve composition root.
+    // app.New (build_app) adds ServeCommand AND every extra spec command, so the
+    // Service tool exposes all its verbs — and the serve command carries the spec
+    // serve command's flags + summary/long — with NO hand-edit to main.go.
+    let mut files = vec![(PathBuf::from("main.go"), build_main(spec))];
     files.extend(base_app_files(spec));
     files.push((PathBuf::from("internal/app/serve.go"), build_serve(spec)));
+    // When controller-go is declared the Service also gets a dedicated reconciler
+    // seam shell (reconcilerFactory + buildReconciler + the no-op default) — the
+    // controller-side analogue of client.go's clientFactory. A hand-written
+    // reconciler registers via init(){ reconcilerFactory = … } with NO shell edit.
+    if has_primitive(spec, "controller-go") {
+        files.push((PathBuf::from("internal/app/reconciler.go"), build_reconciler_shell(spec)));
+    }
     files
 }
 
@@ -1894,6 +1930,13 @@ fn build_serve(spec: &GoToolSpec) -> GoFile {
     if wires_controller {
         imports.push(GoImport::aliased("controller", "github.com/pleme-io/controller-go"));
     }
+    // A spec serve flag with require_non_empty pulls in a fmt.Errorf validator.
+    if spec_serve_command(spec)
+        .map(|c| c.flags.iter().any(|fl| fl.require_non_empty))
+        .unwrap_or(false)
+    {
+        imports.push(GoImport::plain("fmt"));
+    }
     f.imports = imports;
 
     // serveCommand builder.
@@ -1903,8 +1946,42 @@ fn build_serve(spec: &GoToolSpec) -> GoFile {
     f
 }
 
+/// The spec's `serve` command, if the author declared one in `:commands`. Its
+/// `:flags` + `:summary` + `:long` are rendered onto the generated serve command
+/// (so `--kubeconfig`/`--leader-elect` and the author's help text appear), while
+/// the lifecycle/controller composition stays engine-owned. A spec with no
+/// `serve` command keeps the engine's default summary/long and no extra flags.
+fn spec_serve_command(spec: &GoToolSpec) -> Option<&CommandSpec> {
+    spec.commands.iter().find(|c| c.name == "serve")
+}
+
 /// `func ServeCommand() cli.Command { … Run: …{ cfg, err := LoadConfig(ctx); … return Serve(ctx, cfg) } }`.
+///
+/// When the spec declares a `serve` command, its `:flags` are bound on the
+/// generated command (so the declared `--kubeconfig`/`--leader-elect` etc. reach
+/// the typed flag layer) and its `:summary`/`:long` override the engine defaults —
+/// the M4 Action :commands fix, applied to the Service serve command.
 fn build_serve_command(spec: &GoToolSpec) -> GoFuncDecl {
+    let spec_serve = spec_serve_command(spec);
+    let serve_flags: &[FlagSpec] = spec_serve.map(|c| c.flags.as_slice()).unwrap_or(&[]);
+
+    let mut body = GoBlock::new();
+
+    // Flag declarations from the spec serve command: <var> := cli.NewFlag[T](…).
+    // They are bound on the cli.Command below so the declared flags appear in
+    // `serve --help`. The flag values are available to a real Serve via the
+    // FlagSet (the engine's serve loop self-loads config; flags are the typed
+    // surface a hand-written Serve override or future plumbing reads).
+    for flag in serve_flags {
+        body.push(GoStmt::ShortDecl {
+            names: vec![flag_var(&flag.name)],
+            values: vec![build_flag_expr(spec, flag)],
+        });
+    }
+    if !serve_flags.is_empty() {
+        body.push(GoStmt::Blank);
+    }
+
     let mut run_body = GoBlock::new();
     run_body.push(GoStmt::Comment(
         "Load the ONE typed config via the canonical shikumi loader (Law 3), then call the\n\
@@ -1924,23 +2001,36 @@ fn build_serve_command(spec: &GoToolSpec) -> GoFuncDecl {
         vec![GoExpr::ident("ctx"), GoExpr::ident("cfg")],
     )]));
 
-    let mut body = GoBlock::new();
+    // Summary/Long: the spec serve command's text when declared, else the engine
+    // defaults (so a Service with no spec serve command is unchanged).
+    let summary = spec_serve
+        .map(|c| c.summary.clone())
+        .unwrap_or_else(|| "run the service: lifecycle-owned run loop + health planes".to_string());
+    let long = spec_serve.and_then(|c| c.long.clone()).unwrap_or_else(|| {
+        "serve loads the typed config via shikumi (defaults > env > file), builds the \
+         logging-go logger, and runs the lifecycle-go owner which owns the run loop, the \
+         graceful drain, and the /livez|/readyz|/startupz health planes. Stop it with \
+         SIGINT/SIGTERM for a graceful drain."
+            .to_string()
+    });
+
+    let mut fields: Vec<(Option<String>, GoExpr)> = vec![
+        (Some("Name".into()), GoExpr::str("serve")),
+        (Some("Summary".into()), GoExpr::str(summary)),
+        (Some("Long".into()), GoExpr::str(long)),
+    ];
+    // Flags: func(fs *flag.FlagSet) { <var>.Bind(fs); ... } — only when the spec
+    // serve command declared flags.
+    if let Some(cmd) = spec_serve {
+        if !cmd.flags.is_empty() {
+            fields.push((Some("Flags".into()), build_flags_closure(cmd)));
+        }
+    }
+    fields.push((Some("Run".into()), run_closure(run_body)));
+
     body.push(GoStmt::Return(vec![GoExpr::Composite {
         ty: GoType::qualified("cli", "Command"),
-        fields: vec![
-            (Some("Name".into()), GoExpr::str("serve")),
-            (Some("Summary".into()), GoExpr::str("run the service: lifecycle-owned run loop + health planes")),
-            (
-                Some("Long".into()),
-                GoExpr::str(
-                    "serve loads the typed config via shikumi (defaults > env > file), builds the \
-                     logging-go logger, and runs the lifecycle-go owner which owns the run loop, the \
-                     graceful drain, and the /livez|/readyz|/startupz health planes. Stop it with \
-                     SIGINT/SIGTERM for a graceful drain.",
-                ),
-            ),
-            (Some("Run".into()), run_closure(run_body)),
-        ],
+        fields,
         addr_of: false,
     }]));
 
@@ -2042,13 +2132,38 @@ fn build_serve_fn(spec: &GoToolSpec, wires_server: bool, wires_controller: bool)
     }
 
     if wires_controller {
+        // r, err := buildReconciler(cfg, log)  — the reconciler SEAM (analogous to
+        // client.go's NewClient/clientFactory). The engine bakes in NO concrete
+        // reconciler; a hand-written reconciler registers via the reconcilerFactory
+        // plug-point in its init(). When none is registered buildReconciler returns
+        // the no-op default, so the generated shell builds and runs unmodified.
+        body.push(GoStmt::Comment(
+            "controller-go is declared: build the reconcile chassis. The reconciler comes from\n\
+             the buildReconciler SEAM (reconciler.go) — the controller-side analogue of\n\
+             client.go's NewClient/clientFactory. The engine bakes in NO concrete reconciler\n\
+             (worlds-separate); a PRIVATE hand-written reconciler registers itself via\n\
+             reconcilerFactory in its init(). buildReconciler returns the no-op default until\n\
+             one is wired in, so this generated file compiles and runs with ZERO hand-edits."
+                .into(),
+        ));
+        body.push(GoStmt::ShortDecl {
+            names: vec!["reconciler".into(), "err".into()],
+            values: vec![GoExpr::call(
+                GoExpr::ident("buildReconciler"),
+                vec![GoExpr::ident("cfg"), GoExpr::ident("log")],
+            )],
+        });
+        body.push(err_check_return(GoExpr::call(
+            GoExpr::ident("ErrConfig"),
+            vec![GoExpr::ident("err")],
+        )));
         // ctrl, err := controller.New(cfg.Controller, reconciler, controller.For(gvk), controller.WithLogger(log))
         body.push(GoStmt::Comment(
-            "controller-go is declared: build the reconcile chassis via the canonical\n\
-             controller.New(cfg, Reconciler, opts...) — a ReconcileFunc reconciler, a watched\n\
-             kind (controller.For; controller.New returns ErrNoKind without one), and the shared\n\
-             logger. Then run it as the ctx-aware App.Go(\"reconcile\", ctrl.Run) unit: the\n\
-             controller owns its manager + work queue; lifecycle owns the spine (§2.7)."
+            "controller.New(cfg, Reconciler, opts...) — the canonical chassis constructor: the\n\
+             seam-supplied reconciler, a watched kind (controller.For; New returns ErrNoKind\n\
+             without one), and the shared logger. Then run it as the ctx-aware\n\
+             App.Go(\"reconcile\", ctrl.Run) unit: the controller owns its manager + work queue;\n\
+             lifecycle owns the spine (§2.7)."
                 .into(),
         ));
         body.push(GoStmt::ShortDecl {
@@ -2057,7 +2172,7 @@ fn build_serve_fn(spec: &GoToolSpec, wires_server: bool, wires_controller: bool)
                 GoExpr::path(&["controller", "New"]),
                 vec![
                     GoExpr::path(&["cfg", "Controller"]),
-                    reconcileFuncExpr(),
+                    GoExpr::ident("reconciler"),
                     GoExpr::call(
                         GoExpr::path(&["controller", "For"]),
                         vec![watchedGVKExpr()],
@@ -2207,23 +2322,192 @@ fn watchedGVKExpr() -> GoExpr {
     }
 }
 
-/// The sample reconcile body for the controller-go leaf — a `ReconcileFunc`
-/// that returns `controller.Done`.
-#[allow(non_snake_case)]
-fn reconcileFuncExpr() -> GoExpr {
-    let mut body = GoBlock::new();
-    body.push(GoStmt::Return(vec![GoExpr::path(&["controller", "Done"]), GoExpr::nil()]));
-    GoExpr::call(
-        GoExpr::path(&["controller", "ReconcileFunc"]),
-        vec![closure(
-            vec![
-                GoParam { name: "_".into(), ty: GoType::qualified("context", "Context") },
-                GoParam { name: "_".into(), ty: GoType::qualified("controller", "Request") },
+/// Build `internal/app/reconciler.go` — the RECONCILER SEAM shell, emitted only
+/// for a Service that declares controller-go. It is the controller-side analogue
+/// of client.go's clientFactory/NewClient seam: the engine bakes in NO concrete
+/// reconciler (worlds-separate), it only emits the swap-in plug-point. The shell
+/// declares:
+///
+///   - `var reconcilerFactory func(cfg Config, log *slog.Logger) (controller.Reconciler, error)`
+///     — the nil-able plug-point a PRIVATE hand-written reconciler registers in
+///     its `init()` (e.g. `func init() { reconcilerFactory = newAuthReconciler }`).
+///   - `func buildReconciler(cfg Config, log *slog.Logger) (controller.Reconciler, error)`
+///     — the seam the generated serve.go calls: it delegates to reconcilerFactory
+///     when set, else returns the no-op default so the chassis still builds.
+///   - `type defaultNoopReconciler struct{}` + its `Reconcile` method returning
+///     `controller.Done, nil` — the honest converged no-op fallback.
+///
+/// The concrete reconciler lives in a SEPARATE hand-written file (e.g.
+/// reconciler_impl.go / the consumer's reconciler.go override) free of any
+/// generated header; re-forging this file leaves that registration intact (init()
+/// runs at import time regardless of which file declares reconcilerFactory). This
+/// mirrors how client_adapter.go registers clientFactory.
+fn build_reconciler_shell(_spec: &GoToolSpec) -> GoFile {
+    let mut f = GoFile::new("app");
+    f.doc = Some(
+        "Reconciler is the controller-go reconcile SEAM — the controller-side analogue of\n\
+         client.go's NewClient/clientFactory. ONLY the plug-point is generated: the engine\n\
+         bakes in NO concrete reconciler (worlds-separate). The generated serve.go calls\n\
+         buildReconciler to obtain its controller.Reconciler; buildReconciler delegates to the\n\
+         package-level reconcilerFactory when a PRIVATE adapter has registered one, else\n\
+         returns the converged no-op default so the chassis still builds.\n\
+         \n\
+         The CONCRETE reconciler is NOT generated and must NOT live here: author it by hand in\n\
+         a SEPARATE file (e.g. reconciler_impl.go), free of any generated header, where its\n\
+         init() registers the constructor:\n\
+         \n\
+         \tfunc init() { reconcilerFactory = newMyReconciler }\n\
+         \n\
+         Because init() runs at import time, the registration survives re-forging this file —\n\
+         exactly the way client_adapter.go registers clientFactory."
+            .into(),
+    );
+    f.imports = vec![
+        GoImport::plain("context"),
+        GoImport::plain("log/slog"),
+        GoImport::aliased("controller", "github.com/pleme-io/controller-go"),
+    ];
+
+    // var reconcilerFactory func(cfg Config, log *slog.Logger) (controller.Reconciler, error)
+    f.decls.push(GoDecl::Var(GoVarDecl {
+        name: "reconcilerFactory".into(),
+        ty: Some(GoType::FuncSignature {
+            params: vec![
+                GoType::named("Config"),
+                GoType::pointer(GoType::qualified("slog", "Logger")),
             ],
-            vec![GoType::qualified("controller", "Result"), GoType::named("error")],
-            body,
-        )],
-    )
+            returns: vec![
+                GoType::qualified("controller", "Reconciler"),
+                GoType::named("error"),
+            ],
+        }),
+        value: None,
+        doc: Some(
+            "reconcilerFactory is the swap-in plug-point for the concrete controller.Reconciler\n\
+             the chassis runs — the reconciler-side analogue of client.go's clientFactory. It is\n\
+             nil in the generated tool (no concrete reconcile logic leaks into the public engine\n\
+             — worlds-separate); a PRIVATE hand-written reconciler (a SEPARATE file, never\n\
+             regenerated) registers the concrete constructor in its init():\n\
+             \n\
+             \tfunc init() { reconcilerFactory = newMyReconciler }\n\
+             \n\
+             Because init() runs at import time, the registration survives re-forging this file."
+                .into(),
+        ),
+        block_id: None,
+    }));
+
+    // func buildReconciler(cfg Config, log *slog.Logger) (controller.Reconciler, error) {
+    //   if reconcilerFactory == nil { return defaultNoopReconciler{}, nil }
+    //   return reconcilerFactory(cfg, log)
+    // }
+    let mut br_body = GoBlock::new();
+    let mut nil_guard = GoBlock::new();
+    nil_guard.push(GoStmt::Return(vec![
+        GoExpr::Composite {
+            ty: GoType::named("defaultNoopReconciler"),
+            fields: vec![],
+            addr_of: false,
+        },
+        GoExpr::nil(),
+    ]));
+    br_body.push(GoStmt::If {
+        init: None,
+        cond: GoExpr::binary("==", GoExpr::ident("reconcilerFactory"), GoExpr::nil()),
+        body: nil_guard,
+        else_body: None,
+    });
+    br_body.push(GoStmt::Return(vec![GoExpr::call(
+        GoExpr::ident("reconcilerFactory"),
+        vec![GoExpr::ident("cfg"), GoExpr::ident("log")],
+    )]));
+    f.decls.push(GoDecl::Func(GoFuncDecl {
+        name: "buildReconciler".into(),
+        doc: Some(
+            "buildReconciler is the constructor seam the generated serve.go calls to obtain the\n\
+             chassis reconciler. It delegates to the registered reconcilerFactory; when none has\n\
+             registered (the generated default) it returns a converged no-op reconciler so the\n\
+             controller chassis still builds and runs — the public engine never bakes in concrete\n\
+             reconcile logic, and a private adapter swaps it in via reconcilerFactory."
+                .into(),
+        ),
+        recv: None,
+        params: vec![
+            GoParam { name: "cfg".into(), ty: GoType::named("Config") },
+            GoParam {
+                name: "log".into(),
+                ty: GoType::pointer(GoType::qualified("slog", "Logger")),
+            },
+        ],
+        returns: vec![
+            GoType::qualified("controller", "Reconciler"),
+            GoType::named("error"),
+        ],
+        body: br_body,
+    }));
+
+    // type defaultNoopReconciler struct{}
+    f.decls.push(GoDecl::Type(GoTypeDecl {
+        name: "defaultNoopReconciler".into(),
+        doc: Some(
+            "defaultNoopReconciler is the converged no-op reconciler buildReconciler returns when\n\
+             no reconcilerFactory is registered. It satisfies controller.Reconciler with a Reconcile\n\
+             that always reports converged (controller.Done) — the honest empty seam that keeps the\n\
+             generated controller chassis compiling until a private reconciler is wired in."
+                .into(),
+        ),
+        markers: vec![],
+        body: GoTypeBody::Struct(vec![]),
+    }));
+
+    // func (defaultNoopReconciler) Reconcile(_ context.Context, _ controller.Request) (controller.Result, error) {
+    //   return controller.Done, nil
+    // }
+    let mut rec_body = GoBlock::new();
+    rec_body.push(GoStmt::Return(vec![
+        GoExpr::path(&["controller", "Done"]),
+        GoExpr::nil(),
+    ]));
+    f.decls.push(GoDecl::Func(GoFuncDecl {
+        name: "Reconcile".into(),
+        doc: Some(
+            "Reconcile is the no-op converge: it reports the object as already converged\n\
+             (controller.Done) without touching any external state. A real reconciler (registered\n\
+             via reconcilerFactory) replaces this with its Get → diff → act logic."
+                .into(),
+        ),
+        recv: Some(go_synthesizer::GoRecv {
+            name: "_".into(),
+            ty: GoType::named("defaultNoopReconciler"),
+        }),
+        params: vec![
+            GoParam { name: "_".into(), ty: GoType::qualified("context", "Context") },
+            GoParam { name: "_".into(), ty: GoType::qualified("controller", "Request") },
+        ],
+        returns: vec![
+            GoType::qualified("controller", "Result"),
+            GoType::named("error"),
+        ],
+        body: rec_body,
+    }));
+
+    // compile-time proof: var _ controller.Reconciler = defaultNoopReconciler{}
+    f.decls.push(GoDecl::Var(GoVarDecl {
+        name: "_".into(),
+        ty: Some(GoType::qualified("controller", "Reconciler")),
+        value: Some(GoExpr::Composite {
+            ty: GoType::named("defaultNoopReconciler"),
+            fields: vec![],
+            addr_of: false,
+        }),
+        doc: Some(
+            "compile-time assertion that defaultNoopReconciler satisfies controller.Reconciler."
+                .into(),
+        ),
+        block_id: None,
+    }));
+
+    f
 }
 
 /// The ctx-aware `work` unit body passed to `app.Go("work", …)`. It blocks on

@@ -251,11 +251,16 @@ mod tests {
     fn service_execute_outermost_and_lifecycle_nested_in_serve() {
         let r = rendered(&service_spec());
         let main = &r["main.go"];
-        // §3.5: errs.Exit is the single exit funnel.
-        assert!(main.contains("errs.Exit(run())"));
-        // borealis.Execute is the OUTERMOST entrypoint.
-        assert!(main.contains("return borealis.Execute(ctx, root)"));
-        assert!(main.contains("root.Add(app.ServeCommand())"));
+        // §3.5: errs.Exit is the single exit funnel. The Service kind now reuses the
+        // proven Cli main (load → derive → theme → grammar → execute → exit) so the
+        // serve command lives under app.New ALONGSIDE the spec :commands.
+        assert!(main.contains("errs.Exit(run(context.Background()))"));
+        // borealis.Execute is still the OUTERMOST entrypoint (mapped through exit).
+        assert!(main.contains("return exit.Map(borealis.Execute(ctx, root))"));
+        assert!(main.contains("root := app.New(cfg, log, theme)"));
+        // app.New wires the ServeCommand alongside the spec command tree.
+        let app = &r["internal/app/app.go"];
+        assert!(app.contains("ServeCommand()"), "Service root missing serve entrypoint:\n{app}");
         // The serve composition root nests lifecycle.New(...).Go("work", ...).Run(ctx).
         let serve = &r["internal/app/serve.go"];
         assert!(serve.contains("func ServeCommand() cli.Command"));
@@ -495,22 +500,144 @@ mod tests {
     fn controller_service_wires_chassis_with_real_api() {
         let r = rendered(&controller_service_spec());
         let serve = &r["internal/app/serve.go"];
-        // controller.New(cfg.Controller, ReconcileFunc, For(gvk), WithLogger(log)) —
-        // the canonical New(cfg, Reconciler, opts...) shape from controller-go.
-        assert!(serve.contains("controller.New(cfg.Controller, controller.ReconcileFunc("));
+        // The reconciler comes from the buildReconciler SEAM (Gap 1), not a baked-in
+        // no-op: serve obtains it, then threads it into the canonical chassis ctor.
+        assert!(serve.contains("reconciler, err := buildReconciler(cfg, log)"));
+        assert!(serve.contains("controller.New(cfg.Controller, reconciler, controller.For("));
         // A watched kind is supplied (else controller.New returns ErrNoKind).
         assert!(serve.contains("controller.For(controller.GVKConfig{"));
         assert!(serve.contains("Version: \"v1\","));
         assert!(serve.contains("Kind: \"ConfigMap\","));
         // The shared logger is threaded in as an Option.
         assert!(serve.contains("controller.WithLogger(log)"));
-        // The reconciler returns the typed controller.Done result.
-        assert!(serve.contains("return controller.Done, nil"));
         // Run as the ctx-aware App.Go("reconcile", ctrl.Run) unit.
         assert!(serve.contains("app.Go(\"reconcile\", ctrl.Run)"));
+        // serve.go no longer bakes in a reconciler: the no-op ReconcileFunc + its
+        // Done return moved to the reconciler.go seam (the default fallback).
+        assert!(!serve.contains("controller.ReconcileFunc("), "serve must not bake in a reconciler:\n{serve}");
         // The Controller sub-struct is embedded in the typed Config.
         let cfg = &r["internal/app/config.go"];
         assert!(cfg.contains("Controller controller.Config"));
+    }
+
+    // ── Milestone 5: Service+controller seam parity — reconciler seam + spec cmds ──
+
+    /// A controller service whose spec declares a `serve` command with flags +
+    /// extra :commands — the Wave-2 operator shape that surfaced the two gaps.
+    fn operator_service_spec() -> GoToolSpec {
+        spec_from(
+            r#"(defgotool :name "op-svc" :kind Service
+                :description "operator service proof" :profile "nord"
+                :primitives ("borealis" "cli-go" "errors-go" "logging-go" "shikumi-go" "lifecycle-go" "controller-go")
+                :config-fields ((:name "access_id" :ty Str :yaml "accessId"))
+                :commands (
+                  (:name "serve"
+                   :summary "run the operator: lifecycle-owned reconcile loop + health planes"
+                   :long "Run the controller: load the typed config, build the logger, and run the lifecycle owner which owns the reconcile loop and the health planes."
+                   :flags (
+                     (:name "kubeconfig"   :ty Str  :usage "path to a kubeconfig (empty uses in-cluster config)")
+                     (:name "leader-elect" :ty Bool :default "true" :usage "enable leader election for HA deployments")))
+                  (:name "version-info" :summary "print build identity")))"#,
+        )
+    }
+
+    #[test]
+    fn reconciler_factory_seam_emitted_in_reconciler_shell() {
+        // GAP 1: a Service that declares controller-go gets a dedicated reconciler.go
+        // seam shell — the controller-side analogue of client.go's clientFactory.
+        let r = rendered(&controller_service_spec());
+        let rec = &r["internal/app/reconciler.go"];
+        // The nil-able plug-point var, typed to the real controller.Reconciler.
+        assert!(
+            rec.contains("var reconcilerFactory func(Config, *slog.Logger) (controller.Reconciler, error)"),
+            "missing reconcilerFactory plug-point:\n{rec}"
+        );
+        // buildReconciler delegates to the factory with the seam nil-guard.
+        assert!(rec.contains("func buildReconciler(cfg Config, log *slog.Logger) (controller.Reconciler, error)"));
+        assert!(rec.contains("if reconcilerFactory == nil {"));
+        assert!(rec.contains("return defaultNoopReconciler{}, nil"));
+        assert!(rec.contains("return reconcilerFactory(cfg, log)"));
+        // The no-op default fallback satisfies controller.Reconciler.
+        assert!(rec.contains("type defaultNoopReconciler struct {"));
+        assert!(rec.contains("Reconcile(_ context.Context, _ controller.Request) (controller.Result, error)"));
+        assert!(rec.contains("return controller.Done, nil"));
+        assert!(rec.contains("var _ controller.Reconciler = defaultNoopReconciler{}"));
+        // The doc-comment documents the private-adapter init() registration path
+        // (matching client_adapter.go's clientFactory registration).
+        assert!(rec.contains("func init() { reconcilerFactory = newMyReconciler }"));
+        assert!(rec.contains("SEPARATE file"));
+        // Worlds-separate: the seam never names a vendor SDK.
+        assert!(!rec.to_lowercase().contains("akeyless"));
+    }
+
+    #[test]
+    fn serve_calls_build_reconciler_seam_not_baked_noop() {
+        // GAP 1: the generated serve.go delegates to the buildReconciler seam and
+        // threads the result into controller.New — no baked-in reconciler.
+        let r = rendered(&controller_service_spec());
+        let serve = &r["internal/app/serve.go"];
+        assert!(serve.contains("reconciler, err := buildReconciler(cfg, log)"));
+        assert!(serve.contains("controller.New(cfg.Controller, reconciler,"));
+        assert!(!serve.contains("controller.ReconcileFunc("), "serve baked in a reconciler:\n{serve}");
+        // A Service WITHOUT controller-go gets NO reconciler.go shell.
+        let r2 = rendered(&service_spec());
+        assert!(!r2.contains_key("internal/app/reconciler.go"));
+    }
+
+    #[test]
+    fn service_serve_command_carries_spec_flags_and_text() {
+        // GAP 2: the generated serve command renders the spec serve command's flags
+        // (--kubeconfig / --leader-elect) + its summary/long, not the engine text.
+        let r = rendered(&operator_service_spec());
+        let serve = &r["internal/app/serve.go"];
+        // The declared flags appear as typed cli.NewFlag[T] declarations, bound in
+        // a Flags closure so they show in `serve --help`.
+        assert!(serve.contains("cli.NewFlag[string](\"kubeconfig\""), "missing --kubeconfig flag:\n{serve}");
+        assert!(serve.contains("cli.NewFlag[bool](\"leader-elect\", true"), "missing --leader-elect flag:\n{serve}");
+        assert!(serve.contains("Flags: func(fs *flag.FlagSet)"));
+        assert!(serve.contains("kubeconfig.Bind(fs)"));
+        assert!(serve.contains("leaderElect.Bind(fs)"));
+        // The spec serve command's summary + long override the engine defaults.
+        assert!(serve.contains("Summary: \"run the operator: lifecycle-owned reconcile loop + health planes\""));
+        assert!(serve.contains("Run the controller: load the typed config"));
+        // The lifecycle/controller nesting is intact.
+        assert!(serve.contains("lifecycle.New(cfg.Lifecycle,"));
+        assert!(serve.contains("reconciler, err := buildReconciler(cfg, log)"));
+        assert!(serve.contains("app.Go(\"reconcile\", ctrl.Run)"));
+    }
+
+    #[test]
+    fn service_renders_extra_spec_commands() {
+        // GAP 2: a Service renders its non-serve spec :commands into the cli grammar
+        // (via build_app), alongside ServeCommand — and does NOT emit a duplicate
+        // serveCmd for the spec "serve" command.
+        let r = rendered(&operator_service_spec());
+        let app = &r["internal/app/app.go"];
+        // ServeCommand is wired (the serve composition root).
+        assert!(app.contains("ServeCommand()"), "Service root missing serve entrypoint:\n{app}");
+        // The extra spec command gets a generic builder + is added to the root.
+        assert!(app.contains("func versionInfoCmd("), "missing extra spec command builder:\n{app}");
+        assert!(app.contains("versionInfoCmd(cfg, log, theme)"));
+        // No duplicate serveCmd builder for the spec "serve" command (ServeCommand
+        // owns it).
+        assert!(!app.contains("func serveCmd("), "duplicate serveCmd builder leaked:\n{app}");
+        assert!(!app.contains("serveCmd(cfg, log, theme)"));
+        // main is the proven Cli shape with config/log/theme loaded.
+        let main = &r["main.go"];
+        assert!(main.contains("root := app.New(cfg, log, theme)"));
+        assert!(main.contains("return exit.Map(borealis.Execute(ctx, root))"));
+    }
+
+    #[test]
+    fn service_seam_names_no_vendor_for_controller_kind() {
+        // Worlds-separate holds for the Service+controller shape: nothing the engine
+        // emits (serve.go, reconciler.go, app.go, …) names a vendor SDK.
+        for spec in [controller_service_spec(), operator_service_spec()] {
+            for (path, file) in lower(&spec) {
+                let src = print_file(&file).to_lowercase();
+                assert!(!src.contains("akeyless"), "{} named akeyless", path.display());
+            }
+        }
     }
 
     // ── Milestone 4: functional api_op seam — flags reach the op, result renders ──
