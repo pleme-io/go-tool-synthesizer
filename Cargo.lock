@@ -67,7 +67,7 @@ checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
 
 [[package]]
 name = "go-synthesizer"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "synthesizer-core",
 ]
@@ -180,12 +180,13 @@ dependencies = [
 
 [[package]]
 name = "synthesizer-core"
-version = "0.1.0"
-source = "git+https://github.com/pleme-io/synthesizer-core#bd1767f5d334a2d5a2deb50d8c97cc14620bffeb"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2d61c6a42add42ba68340770985043123fa594ad86b0a02b613bd9c0de62bf2f"
 
 [[package]]
 name = "tatara-lisp"
-version = "0.2.10"
+version = "0.2.67"
 dependencies = [
  "blake3",
  "serde",
@@ -196,7 +197,7 @@ dependencies = [
 
 [[package]]
 name = "tatara-lisp-derive"
-version = "0.2.10"
+version = "0.2.67"
 dependencies = [
  "proc-macro2",
  "quote",
