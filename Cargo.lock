@@ -186,7 +186,7 @@ checksum = "2d61c6a42add42ba68340770985043123fa594ad86b0a02b613bd9c0de62bf2f"
 
 [[package]]
 name = "tatara-lisp"
-version = "0.2.67"
+version = "0.2.151"
 dependencies = [
  "blake3",
  "serde",
@@ -197,7 +197,7 @@ dependencies = [
 
 [[package]]
 name = "tatara-lisp-derive"
-version = "0.2.67"
+version = "0.2.151"
 dependencies = [
  "proc-macro2",
  "quote",
